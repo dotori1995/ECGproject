@@ -1,48 +1,98 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import numpy as np
 import os
 from pathlib import Path
 import time
 import wfdb
 import librosa
-from main import QDeepModel, CLASS_MAPPING, CLASS_NAMES
+import onnxruntime as ort
+try:
+    import tensorflow as tf
+    TFLITE_AVAILABLE = True
+except ImportError:
+    TFLITE_AVAILABLE = False
+    print("경고: TensorFlow가 설치되지 않아 TensorFlow Lite 기능을 사용할 수 없습니다.")
+from main import CLASS_MAPPING, CLASS_NAMES
 
 # --- [ 추론 함수 ] ---
 
-def load_model(checkpoint_path, input_shape=(224, 224, 3), classes=3, device='cuda' if torch.cuda.is_available() else 'cpu'):
+def load_onnx_model(onnx_path, device='cpu'):
     """
-    저장된 모델 체크포인트를 로드합니다.
+    ONNX 모델을 로드합니다.
     
     Args:
-        checkpoint_path: 체크포인트 파일 경로 (.pth)
-        input_shape: 입력 이미지 크기
-        classes: 클래스 수
-        device: 사용할 디바이스 ('cuda' 또는 'cpu')
+        onnx_path: ONNX 모델 파일 경로 (.onnx)
+        device: 사용할 디바이스 ('cpu', 'cuda', 'tensorrt' 등)
     
     Returns:
-        로드된 모델
+        ONNX Runtime InferenceSession
     """
-    print(f"\n--- [모델 로드] ---")
-    print(f"체크포인트 경로: {checkpoint_path}")
+    print(f"\n--- [ONNX 모델 로드] ---")
+    print(f"ONNX 모델 경로: {onnx_path}")
     print(f"사용 디바이스: {device}")
     
-    # 모델 인스턴스 생성
-    model = QDeepModel(input_shape=input_shape, classes=classes)
+    if not os.path.exists(onnx_path):
+        raise FileNotFoundError(f"ONNX 모델 파일을 찾을 수 없습니다: {onnx_path}")
     
-    # 체크포인트 로드
-    if not os.path.exists(checkpoint_path):
-        raise FileNotFoundError(f"체크포인트 파일을 찾을 수 없습니다: {checkpoint_path}")
+    # ONNX Runtime 세션 옵션 설정
+    providers = []
+    if device == 'cuda':
+        # CUDA 사용 가능 여부 확인
+        try:
+            providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+        except:
+            providers = ['CPUExecutionProvider']
+            print("경고: CUDA를 사용할 수 없어 CPU로 실행합니다.")
+    else:
+        providers = ['CPUExecutionProvider']
     
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model = model.to(device)
-    model.eval()
+    # 세션 생성
+    session = ort.InferenceSession(onnx_path, providers=providers)
     
-    print(f"모델 로드 완료 (Epoch: {checkpoint.get('epoch', 'N/A')}, Val Loss: {checkpoint.get('val_loss', 'N/A'):.4f})")
+    # 입력/출력 정보 출력
+    input_name = session.get_inputs()[0].name
+    output_name = session.get_outputs()[0].name
+    input_shape = session.get_inputs()[0].shape
+    output_shape = session.get_outputs()[0].shape
     
-    return model
+    print(f"모델 로드 완료")
+    print(f"  입력 이름: {input_name}, 크기: {input_shape}")
+    print(f"  출력 이름: {output_name}, 크기: {output_shape}")
+    print(f"  실행 제공자: {session.get_providers()}")
+    
+    return session
+
+def load_tflite_model(tflite_path):
+    """
+    TensorFlow Lite 모델을 로드합니다.
+    
+    Args:
+        tflite_path: TensorFlow Lite 모델 파일 경로 (.tflite)
+    
+    Returns:
+        TensorFlow Lite Interpreter
+    """
+    if not TFLITE_AVAILABLE:
+        raise ImportError("TensorFlow가 설치되지 않았습니다. pip install tensorflow")
+    
+    print(f"\n--- [TensorFlow Lite 모델 로드] ---")
+    print(f"TFLite 모델 경로: {tflite_path}")
+    
+    if not os.path.exists(tflite_path):
+        raise FileNotFoundError(f"TensorFlow Lite 모델 파일을 찾을 수 없습니다: {tflite_path}")
+    
+    # TensorFlow Lite Interpreter 생성
+    interpreter = tf.lite.Interpreter(model_path=tflite_path)
+    interpreter.allocate_tensors()
+    
+    # 입력/출력 정보 가져오기
+    input_details = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
+    
+    print(f"모델 로드 완료")
+    print(f"  입력 이름: {input_details[0]['name']}, 크기: {input_details[0]['shape']}, 타입: {input_details[0]['dtype']}")
+    print(f"  출력 이름: {output_details[0]['name']}, 크기: {output_details[0]['shape']}, 타입: {output_details[0]['dtype']}")
+    
+    return interpreter
 
 def preprocess_single_file(file_base_path: str, img_shape=(224, 224, 3), segment_length_sec=10, overlap_ratio=0.5):
     """
@@ -99,15 +149,22 @@ def preprocess_single_file(file_base_path: str, img_shape=(224, 224, 3), segment
         
         # CQT 변환
         try:
-            cqt = librosa.cqt(segment, sr=fs, hop_length=512, n_bins=84)
+            # CQT 파라미터 계산 (main.py와 동일한 로직)
+            nyquist = fs / 2
+            max_octaves = np.log2(nyquist / 27.5)
+            n_bins = min(84, int(12 * max_octaves * 0.9))
+            hop_length = max(32, int(fs / 4))
+            
+            cqt = librosa.cqt(segment, sr=fs, hop_length=hop_length, n_bins=n_bins, fmin=27.5)
             cqt_magnitude = np.abs(cqt)
             cqt_log = librosa.amplitude_to_db(cqt_magnitude, ref=np.max)
             cqt_normalized = (cqt_log - cqt_log.min()) / (cqt_log.max() - cqt_log.min() + 1e-8)
             
-            # 이미지 크기로 리사이즈
-            cqt_tensor = torch.from_numpy(cqt_normalized).unsqueeze(0).unsqueeze(0)
-            resized_img = F.interpolate(cqt_tensor, size=(img_shape[0], img_shape[1]), mode='bilinear', align_corners=False)
-            resized_img = resized_img.squeeze().numpy()
+            # 이미지 크기로 리사이즈 (scipy를 사용)
+            from scipy.ndimage import zoom
+            current_shape = cqt_normalized.shape
+            zoom_factors = (img_shape[0] / current_shape[0], img_shape[1] / current_shape[1])
+            resized_img = zoom(cqt_normalized, zoom_factors, order=1)  # bilinear interpolation
             
             # RGB 채널로 변환
             rgb_img = np.stack((resized_img, resized_img, resized_img), axis=-1)
@@ -131,39 +188,95 @@ def preprocess_single_file(file_base_path: str, img_shape=(224, 224, 3), segment
     
     return X_data
 
-def predict(model, X_data, device='cuda' if torch.cuda.is_available() else 'cpu', batch_size=32):
+def predict_onnx(session, X_data, batch_size=32):
     """
-    모델을 사용하여 예측을 수행합니다.
+    ONNX 모델을 사용하여 예측을 수행합니다.
     
     Args:
-        model: 학습된 모델
+        session: ONNX Runtime InferenceSession
         X_data: 입력 데이터 (numpy array, shape: [N, H, W, C])
-        device: 사용할 디바이스
         batch_size: 배치 크기
     
     Returns:
         예측 결과 (클래스 인덱스, 확률)
     """
-    print("\n--- [예측 수행] ---")
+    print("\n--- [ONNX 예측 수행] ---")
     
-    model.eval()
+    # 입력/출력 이름 가져오기
+    input_name = session.get_inputs()[0].name
+    output_name = session.get_outputs()[0].name
     
-    # 데이터를 PyTorch 텐서로 변환 [N, H, W, C] -> [N, C, H, W]
-    X_tensor = torch.FloatTensor(X_data).permute(0, 3, 1, 2).to(device)
+    # 데이터를 ONNX 형식으로 변환 [N, H, W, C] -> [N, C, H, W]
+    # numpy array를 float32로 변환
+    X_data_float32 = X_data.astype(np.float32)
+    X_data_chw = np.transpose(X_data_float32, (0, 3, 1, 2))  # [N, H, W, C] -> [N, C, H, W]
     
     all_preds = []
     all_probs = []
     
-    with torch.no_grad():
-        # 배치 단위로 처리
-        for i in range(0, len(X_tensor), batch_size):
-            batch_X = X_tensor[i:i+batch_size]
-            outputs = model(batch_X)
-            probs = outputs.cpu().numpy()
-            preds = np.argmax(probs, axis=1)
-            
-            all_preds.extend(preds)
-            all_probs.extend(probs)
+    # 배치 단위로 처리
+    for i in range(0, len(X_data_chw), batch_size):
+        batch_X = X_data_chw[i:i+batch_size]
+        
+        # ONNX Runtime으로 추론
+        outputs = session.run([output_name], {input_name: batch_X})
+        probs = outputs[0]  # 첫 번째 출력
+        
+        preds = np.argmax(probs, axis=1)
+        
+        all_preds.extend(preds)
+        all_probs.extend(probs)
+    
+    all_preds = np.array(all_preds)
+    all_probs = np.array(all_probs)
+    
+    print(f"예측 완료: {len(all_preds)}개 세그먼트")
+    
+    return all_preds, all_probs
+
+def predict_tflite(interpreter, X_data, batch_size=1):
+    """
+    TensorFlow Lite 모델을 사용하여 예측을 수행합니다.
+    
+    Args:
+        interpreter: TensorFlow Lite Interpreter
+        X_data: 입력 데이터 (numpy array, shape: [N, H, W, C])
+        batch_size: 배치 크기 (TFLite는 보통 1)
+    
+    Returns:
+        예측 결과 (클래스 인덱스, 확률)
+    """
+    print("\n--- [TensorFlow Lite 예측 수행] ---")
+    
+    # 입력/출력 정보 가져오기
+    input_details = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
+    
+    # 데이터를 TFLite 형식으로 변환 [N, H, W, C] -> [N, C, H, W]
+    X_data_float32 = X_data.astype(np.float32)
+    X_data_chw = np.transpose(X_data_float32, (0, 3, 1, 2))  # [N, H, W, C] -> [N, C, H, W]
+    
+    all_preds = []
+    all_probs = []
+    
+    # TFLite는 배치 크기가 1인 경우가 많으므로 하나씩 처리
+    for i in range(len(X_data_chw)):
+        input_data = X_data_chw[i:i+1]  # 배치 차원 유지 [1, C, H, W]
+        
+        # 입력 데이터 설정
+        interpreter.set_tensor(input_details[0]['index'], input_data)
+        
+        # 추론 실행
+        interpreter.invoke()
+        
+        # 출력 가져오기
+        output_data = interpreter.get_tensor(output_details[0]['index'])
+        probs = output_data[0]  # 배치 차원 제거
+        
+        pred = np.argmax(probs)
+        
+        all_preds.append(pred)
+        all_probs.append(probs)
     
     all_preds = np.array(all_preds)
     all_probs = np.array(all_probs)
@@ -212,32 +325,49 @@ def print_results(preds, probs, class_names=None):
 if __name__ == '__main__':
     
     # ⚠️ 설정 파라미터
-    # 1. 체크포인트 파일 경로
-    CHECKPOINT_PATH = "./qdeep_training_output_limited/best_qdeep_model_limited.pth"
+    # 모델 타입 선택: 'onnx' 또는 'tflite'
+    MODEL_TYPE = 'onnx'  # 'onnx' 또는 'tflite'
+    
+    # 1. 모델 파일 경로
+    ONNX_MODEL_PATH = "./qdeep_training_output_limited/best_qdeep_model_limited.onnx"
+    TFLITE_MODEL_PATH = "./qdeep_training_output_limited/best_qdeep_model_limited.tflite"
     
     # 2. 추론할 데이터 파일 경로 (확장자 제외)
     FILE_BASE_PATH = "./data/data_0_1"  # 실제 데이터 경로로 수정하세요
     
     # 3. 모델 파라미터
     INPUT_SHAPE = (224, 224, 3)
-    CLASSES = 3
     SEGMENT_LENGTH_SEC = 10
     OVERLAP_RATIO = 0.5
     BATCH_SIZE = 32
-    DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+    DEVICE = 'cpu'  # 'cpu' 또는 'cuda' (ONNX Runtime만 해당)
     # -----------------------
     
     # 1. 모델 로드
-    try:
-        model = load_model(
-            checkpoint_path=CHECKPOINT_PATH,
-            input_shape=INPUT_SHAPE,
-            classes=CLASSES,
-            device=DEVICE
-        )
-    except Exception as e:
-        print(f"\n[치명적 오류] 모델 로드 실패: {e}")
-        print("CHECKPOINT_PATH 경로와 파일 존재 여부를 확인하세요.")
+    if MODEL_TYPE == 'onnx':
+        try:
+            model = load_onnx_model(
+                onnx_path=ONNX_MODEL_PATH,
+                device=DEVICE
+            )
+        except Exception as e:
+            print(f"\n[치명적 오류] ONNX 모델 로드 실패: {e}")
+            print("ONNX_MODEL_PATH 경로와 파일 존재 여부를 확인하세요.")
+            print("ONNX 모델이 없다면 convert_to_onnx.py를 먼저 실행하세요.")
+            exit()
+    elif MODEL_TYPE == 'tflite':
+        try:
+            model = load_tflite_model(
+                tflite_path=TFLITE_MODEL_PATH
+            )
+        except Exception as e:
+            print(f"\n[치명적 오류] TensorFlow Lite 모델 로드 실패: {e}")
+            print("TFLITE_MODEL_PATH 경로와 파일 존재 여부를 확인하세요.")
+            print("TensorFlow Lite 모델이 없다면 convert_to_tflite.py를 먼저 실행하세요.")
+            exit()
+    else:
+        print(f"[오류] 지원하지 않는 모델 타입: {MODEL_TYPE}")
+        print("MODEL_TYPE을 'onnx' 또는 'tflite'로 설정하세요.")
         exit()
     
     # 2. 데이터 전처리
@@ -258,12 +388,18 @@ if __name__ == '__main__':
         exit()
     
     # 3. 예측 수행
-    preds, probs = predict(
-        model=model,
-        X_data=X_data,
-        device=DEVICE,
-        batch_size=BATCH_SIZE
-    )
+    if MODEL_TYPE == 'onnx':
+        preds, probs = predict_onnx(
+            session=model,
+            X_data=X_data,
+            batch_size=BATCH_SIZE
+        )
+    elif MODEL_TYPE == 'tflite':
+        preds, probs = predict_tflite(
+            interpreter=model,
+            X_data=X_data,
+            batch_size=1  # TFLite는 보통 배치 크기 1
+        )
     
     # 4. 결과 출력
     print_results(preds, probs, class_names=CLASS_NAMES)

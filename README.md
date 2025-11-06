@@ -67,6 +67,15 @@ python -m venv .
 deactivate
 ```
 
+#### 패키지 설치
+```powershell
+# requirements.txt에 있는 모든 패키지 설치
+pip install -r requirements.txt
+
+# 또는 업그레이드 포함하여 설치
+pip install --upgrade -r requirements.txt
+```
+
 ### 주의사항
 
 1. **자동 생성 파일**: `pyvenv.cfg`는 `venv` 모듈로 가상 환경을 생성할 때 자동으로 생성됩니다.
